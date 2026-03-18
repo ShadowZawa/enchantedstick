@@ -1,6 +1,15 @@
 package com.shadowz.enchantedstick;
 
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents;
+import net.minecraft.enchantment.Enchantment;
+import net.minecraft.enchantment.EnchantmentLevelEntry;
+import net.minecraft.item.EnchantedBookItem;
+import net.minecraft.item.ItemGroups;
+import net.minecraft.item.ItemStack;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryKeys;
+import net.minecraft.registry.RegistryWrapper;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,10 +24,22 @@ public class EnchantedStick implements ModInitializer {
 
 	@Override
 	public void onInitialize() {
-		// This code runs as soon as Minecraft is in a mod-load-ready state.
-		// However, some things (like resources) may still be uninitialized.
-		// Proceed with mild caution.
+		StickEffectHandler.register();
+		registerCustomEnchantedBooks();
 
-		LOGGER.info("Hello Fabric world!");
+		LOGGER.info("EnchantedStick initialized.");
+	}
+
+	private static void registerCustomEnchantedBooks() {
+		ItemGroupEvents.modifyEntriesEvent(ItemGroups.TOOLS).register(entries -> {
+			RegistryWrapper.Impl<Enchantment> enchantmentRegistry = entries.getContext().lookup().getWrapperOrThrow(RegistryKeys.ENCHANTMENT);
+
+			for (RegistryKey<Enchantment> key : StickEnchantments.ALL) {
+				enchantmentRegistry.getOptional(key).ifPresent(entry -> {
+					ItemStack book = EnchantedBookItem.forEnchantment(new EnchantmentLevelEntry(entry, 1));
+					entries.add(book);
+				});
+			}
+		});
 	}
 }

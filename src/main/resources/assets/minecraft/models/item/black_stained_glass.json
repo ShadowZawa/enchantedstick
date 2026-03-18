@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:block/cube_all",
+  "textures": {
+    "all": "enchantedstick:block/glint_white_soft"
+  }
+}
