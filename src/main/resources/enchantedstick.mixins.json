@@ -3,7 +3,10 @@
 	"package": "com.shadowz.enchantedstick.mixin",
 	"compatibilityLevel": "JAVA_21",
 	"mixins": [
-		"ExampleMixin"
+		"BlockItemMixin",
+		"ExampleMixin",
+		"LivingEntityMixin",
+		"PlayerInventoryMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

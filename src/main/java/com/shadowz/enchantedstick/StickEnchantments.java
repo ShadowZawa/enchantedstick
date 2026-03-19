@@ -16,6 +16,7 @@ public final class StickEnchantments {
 	public static final RegistryKey<Enchantment> BOUNCE = key("bounce");
 	public static final RegistryKey<Enchantment> SHATTER = key("shatter");
 	public static final RegistryKey<Enchantment> INFINITY = key("infinity");
+	public static final RegistryKey<Enchantment> SPEED = key("speed");
 	public static final RegistryKey<Enchantment> CHARGE = key("charge");
 
 	public static final List<RegistryKey<Enchantment>> ALL = List.of(
@@ -27,6 +28,7 @@ public final class StickEnchantments {
 		BOUNCE,
 		SHATTER,
 		INFINITY,
+		SPEED,
 		CHARGE
 	);
 

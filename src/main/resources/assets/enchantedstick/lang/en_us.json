@@ -7,5 +7,7 @@
   "enchantment.enchantedstick.bounce": "Bounce",
   "enchantment.enchantedstick.shatter": "Shatter",
   "enchantment.enchantedstick.infinity": "Infinity",
-  "enchantment.enchantedstick.charge": "Charge"
+  "enchantment.enchantedstick.speed": "Speed",
+  "enchantment.enchantedstick.charge": "Charge",
+  "itemGroup.enchantedstick.main": "Enchanted Stick"
 }

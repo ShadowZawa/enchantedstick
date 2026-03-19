@@ -18,6 +18,9 @@
 		"main": [
 			"com.shadowz.enchantedstick.EnchantedStick"
 		],
+		"client": [
+			"com.shadowz.enchantedstick.client.EnchantedStickClient"
+		],
 		"fabric-datagen": [
 			"com.shadowz.enchantedstick.EnchantedStickDataGenerator"
 		]
