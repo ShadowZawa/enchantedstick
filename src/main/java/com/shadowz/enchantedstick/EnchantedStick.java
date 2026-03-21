@@ -14,6 +14,7 @@ import net.minecraft.registry.Registries;
 import net.minecraft.registry.Registry;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
+import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
@@ -41,6 +42,7 @@ public class EnchantedStick implements ModInitializer {
 	@Override
 	public void onInitialize() {
 		StickEffectHandler.register();
+		LibrarianTradeRegistrar.register();
 
 		LOGGER.info("EnchantedStick initialized.");
 	}
@@ -48,11 +50,14 @@ public class EnchantedStick implements ModInitializer {
 	private static void addCustomEnchantedBooks(RegistryWrapper.Impl<Enchantment> enchantmentRegistry, ItemGroup.Entries entries) {
 		for (RegistryKey<Enchantment> key : StickEnchantments.ALL) {
 			enchantmentRegistry.getOptional(key).ifPresent(entry -> {
-				ItemStack book = EnchantedBookItem.forEnchantment(new EnchantmentLevelEntry(entry, 1));
-				// Mark custom enchanted books with model data 1
-				book.set(DataComponentTypes.CUSTOM_MODEL_DATA, new CustomModelDataComponent(1));
-				entries.add(book);
+				entries.add(createCustomEnchantedBook(entry));
 			});
 		}
+	}
+
+	public static ItemStack createCustomEnchantedBook(RegistryEntry<Enchantment> enchantment) {
+		ItemStack book = EnchantedBookItem.forEnchantment(new EnchantmentLevelEntry(enchantment, 1));
+		book.set(DataComponentTypes.CUSTOM_MODEL_DATA, new CustomModelDataComponent(1));
+		return book;
 	}
 }
