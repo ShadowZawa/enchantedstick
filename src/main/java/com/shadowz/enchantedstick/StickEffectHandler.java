@@ -3,6 +3,7 @@ package com.shadowz.enchantedstick;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -13,6 +14,10 @@ import net.minecraft.enchantment.EnchantmentHelper;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.boss.dragon.EnderDragonEntity;
+import net.minecraft.entity.boss.dragon.EnderDragonPart;
+import net.minecraft.entity.damage.DamageSource;
+import net.minecraft.entity.damage.DamageSources;
 import net.minecraft.entity.decoration.DisplayEntity;
 import net.minecraft.entity.effect.StatusEffectInstance;
 import net.minecraft.entity.effect.StatusEffects;
@@ -20,6 +25,7 @@ import net.minecraft.entity.mob.MobEntity;
 import net.minecraft.entity.player.HungerManager;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
+import net.minecraft.item.ItemPlacementContext;
 import net.minecraft.item.Items;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
@@ -42,6 +48,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.world.World;
 
 import java.util.ArrayDeque;
@@ -61,17 +68,32 @@ public final class StickEffectHandler {
 	private static final String MARKER_DATA_KEY = "enchantedstick_marker";
 	private static final String EFFECTS_KEY = "effects";
 	private static final String SOURCE_BLOCK_KEY = "source_block";
+	private static final String INFECTED_BLOCK_DATA_KEY = "infected_block";
+	private static final String INFECTED_SOURCE_BLOCK_KEY = "infected_source_block";
 	private static final String EXPIRES_AT_KEY = "expires_at";
 	private static final String HEAVY_STARTED_KEY = "heavy_started";
 	private static final String HEAVY_Y_KEY = "heavy_y";
 	private static final String EXPLOSION_PRIMED_KEY = "explosion_primed";
+	private static final String EXPLOSION_BURSTS_REMAINING_KEY = "explosion_bursts_remaining";
+	private static final String NEXT_EXPLOSION_TICK_KEY = "next_explosion_tick";
 	private static final float THORNS_DAMAGE = 3.0F;
-	private static final double THORNS_RANGE = 2.0D;
+	private static final float DRAGON_THORNS_DAMAGE = 8.0F;
+	private static final float EXPLOSION_POWER = 6.0F;
+	private static final long BLACK_HOLE_EXPLOSION_INTERVAL_TICKS = 5L;
+	private static final int END_EXPLOSION_BURST_COUNT = 10;
+	private static final long END_EXPLOSION_INTERVAL_TICKS = 5L;
+	private static final double DRAGON_EXPLOSION_RANGE = 12.0D;
+	private static final float DRAGON_EXPLOSION_DAMAGE = 24.0F;
 	private static final double BLACK_HOLE_RANGE = 100.0D;
 	private static final double INFECTION_MOB_RANGE = 50.0D;
 	private static final int INFECTION_LIMIT = 100;
 	private static final int INFECTION_SPREAD_PER_TICK = 96;
-	private static final int CHARGE_REPAIR_PER_SECOND = 5;
+	private static final long INFECTION_VICTIM_DURATION_TICKS = 20L * 20L;
+	private static final double BOUNCE_BASE_VELOCITY = 1.05D;
+	private static final double BOUNCE_STEP_VELOCITY = 0.22D;
+	private static final double BOUNCE_MAX_VELOCITY = 3.25D;
+	private static final int CHARGE_REPAIR_PER_SECOND = 50;
+	private static final int CHARGE_LEVEL_PER_SECOND = 10;
 	private static final float CHARGE_HEAL_PER_SECOND = 2.0F;
 	private static final int CHARGE_FOOD_PER_SECOND = 2;
 	private static final float CHARGE_SATURATION_PER_SECOND = 2.0F;
@@ -80,6 +102,9 @@ public final class StickEffectHandler {
 	private static final Set<UUID> SPEED_ACTIVE = new HashSet<>();
 	private static final Map<UUID, InfectionSpread> ACTIVE_INFECTIONS = new HashMap<>();
 	private static final Map<UUID, InfectionVictimState> INFECTION_VICTIMS = new HashMap<>();
+	private static final Map<net.minecraft.registry.RegistryKey<World>, Set<Long>> INFECTED_BLOCKS = new HashMap<>();
+	private static final Map<UUID, Integer> BOUNCE_CHAIN = new HashMap<>();
+	private static final Map<UUID, Long> BOUNCE_LAST_TICK = new HashMap<>();
 
 	private StickEffectHandler() {
 	}
@@ -87,6 +112,7 @@ public final class StickEffectHandler {
 	public static void register() {
 		AttackBlockCallback.EVENT.register(StickEffectHandler::onAttackBlock);
 		PlayerBlockBreakEvents.AFTER.register(StickEffectHandler::onBlockBroken);
+		UseBlockCallback.EVENT.register(StickEffectHandler::onUseBlock);
 		ServerTickEvents.END_WORLD_TICK.register(StickEffectHandler::tickWorld);
 	}
 
@@ -130,16 +156,61 @@ public final class StickEffectHandler {
 		}
 
 		DisplayEntity.ItemDisplayEntity marker = findMarker(serverWorld, pos);
+		if (marker != null) {
+			MarkerState markerState = readMarkerState(marker);
 
-		if (marker == null) {
-			return;
+			if (markerState.effects.contains(StickEffect.INFINITY)) {
+				grantInfinityBlock(player, state.getBlock());
+			}
 		}
 
-		MarkerState markerState = readMarkerState(marker);
-
-		if (markerState.effects.contains(StickEffect.INFINITY)) {
-			grantInfinityBlock(player, state.getBlock());
+		if (consumeInfectedBlockMark(serverWorld, pos)) {
+			grantInfectedBlock(player, state.getBlock());
 		}
+	}
+
+	private static ActionResult onUseBlock(PlayerEntity player, World world, Hand hand, BlockHitResult hitResult) {
+		if (!(world instanceof ServerWorld serverWorld)) {
+			return ActionResult.PASS;
+		}
+
+		ItemStack stack = player.getStackInHand(hand);
+		if (!isInfectedBlockItem(stack)) {
+			return ActionResult.PASS;
+		}
+
+		Block sourceBlock = readInfectedSourceBlock(stack);
+		if (sourceBlock == Blocks.AIR) {
+			return ActionResult.PASS;
+		}
+
+		ItemPlacementContext placementContext = new ItemPlacementContext(player, hand, stack, hitResult);
+		BlockPos hitPos = hitResult.getBlockPos();
+		BlockPos placePos = world.getBlockState(hitPos).canReplace(placementContext) ? hitPos
+				: hitPos.offset(hitResult.getSide());
+
+		if (!player.canPlaceOn(placePos, hitResult.getSide(), stack)) {
+			return ActionResult.FAIL;
+		}
+
+		BlockState placeState = sourceBlock.getDefaultState();
+		if (!world.getBlockState(placePos).canReplace(placementContext) || !placeState.canPlaceAt(world, placePos)) {
+			return ActionResult.FAIL;
+		}
+
+		if (!world.setBlockState(placePos, placeState, Block.NOTIFY_ALL)) {
+			return ActionResult.FAIL;
+		}
+
+		markInfectedBlock(serverWorld, placePos);
+		createInfectionMarker(serverWorld, placePos, sourceBlock);
+
+		if (!player.isCreative()) {
+			stack.decrement(1);
+		}
+
+		world.playSound(null, placePos, placeState.getSoundGroup().getPlaceSound(), SoundCategory.BLOCKS, 1.0F, 1.0F);
+		return ActionResult.SUCCESS;
 	}
 
 	private static void tickWorld(ServerWorld world) {
@@ -168,10 +239,18 @@ public final class StickEffectHandler {
 
 			updateMarkerVisual(marker, markerState, worldTime);
 
+			if (shouldTriggerBlackHoleExplosionCombo(markerState, worldTime)) {
+				triggerExplosion(world, pos);
+				markerState.explosionPrimed = true;
+				markerState.nextExplosionTick = worldTime + BLACK_HOLE_EXPLOSION_INTERVAL_TICKS;
+				writeMarkerState(marker, markerState);
+			}
+
 			if (markerState.isExpired(worldTime)) {
 				if (markerState.effects.contains(StickEffect.EXPLOSION) && !markerState.explosionPrimed) {
-					world.createExplosion(null, pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D, 4.0F,
-							World.ExplosionSourceType.BLOCK);
+					if (handleExpiredExplosion(world, marker, markerState, pos, worldTime)) {
+						continue;
+					}
 				}
 
 				clearMarkerEffects(marker, markerState);
@@ -246,7 +325,17 @@ public final class StickEffectHandler {
 		markerState.effects.addAll(newEffects);
 		markerState.sourceBlock = blockState.getBlock();
 		markerState.heavyStarted = false;
-		markerState.explosionPrimed = false;
+		resetExplosionState(markerState);
+		configureMarkerDurations(markerState, world.getTime());
+		writeMarkerState(marker, markerState);
+	}
+
+	private static void configureMarkerDurations(MarkerState markerState, long worldTime) {
+		if (hasBlackHoleExplosionCombo(markerState)) {
+			markerState.expiresAt = worldTime + StickEffect.BLACK_HOLE.durationTicks();
+			markerState.nextExplosionTick = worldTime + StickEffect.EXPLOSION.durationTicks();
+			return;
+		}
 
 		int shortestTimedDuration = markerState.effects.stream()
 				.filter(StickEffect::isTimed)
@@ -254,8 +343,7 @@ public final class StickEffectHandler {
 				.min()
 				.orElse(0);
 
-		markerState.expiresAt = shortestTimedDuration > 0 ? world.getTime() + shortestTimedDuration : -1L;
-		writeMarkerState(marker, markerState);
+		markerState.expiresAt = shortestTimedDuration > 0 ? worldTime + shortestTimedDuration : -1L;
 	}
 
 	private static DisplayEntity.ItemDisplayEntity createMarker(ServerWorld world, BlockPos pos) {
@@ -355,12 +443,22 @@ public final class StickEffectHandler {
 
 	private static void applyBounce(ServerWorld world, BlockPos pos) {
 		Box box = new Box(pos).expand(0.15D, 1.0D, 0.15D);
+		long worldTime = world.getTime();
 
 		for (LivingEntity entity : world.getEntitiesByClass(LivingEntity.class, box,
 				living -> living.isOnGround() && isStandingOnMarkedBlock(living, pos))) {
 			if (entity.getVelocity().y <= 0.08D) {
+				if (BOUNCE_LAST_TICK.getOrDefault(entity.getUuid(), -1L) == worldTime) {
+					continue;
+				}
+
+				int chain = BOUNCE_CHAIN.getOrDefault(entity.getUuid(), 0) + 1;
+				BOUNCE_CHAIN.put(entity.getUuid(), chain);
+				BOUNCE_LAST_TICK.put(entity.getUuid(), worldTime);
 				Vec3d currentVelocity = entity.getVelocity();
-				entity.setVelocity(currentVelocity.x, 1.05D, currentVelocity.z);
+				double bounceVelocity = Math.min(BOUNCE_MAX_VELOCITY,
+						BOUNCE_BASE_VELOCITY + (chain - 1) * BOUNCE_STEP_VELOCITY);
+				entity.setVelocity(currentVelocity.x, bounceVelocity, currentVelocity.z);
 				entity.velocityModified = true;
 			}
 		}
@@ -387,6 +485,7 @@ public final class StickEffectHandler {
 
 		for (PlayerEntity player : world.getPlayers(player -> findTrackedFootBlock(player, chargePositions) != null)) {
 			player.heal(CHARGE_HEAL_PER_SECOND);
+			player.addExperience(CHARGE_LEVEL_PER_SECOND);
 
 			HungerManager hungerManager = player.getHungerManager();
 			hungerManager.add(CHARGE_FOOD_PER_SECOND, CHARGE_SATURATION_PER_SECOND);
@@ -405,6 +504,7 @@ public final class StickEffectHandler {
 		InfectionSpread spread = ACTIVE_INFECTIONS.computeIfAbsent(marker.getUuid(),
 				unused -> new InfectionSpread(origin));
 		BlockState sourceState = sourceBlock.getDefaultState();
+		markInfectedBlock(world, origin);
 		int processed = 0;
 
 		while (!spread.frontier.isEmpty() && processed < INFECTION_SPREAD_PER_TICK) {
@@ -428,6 +528,8 @@ public final class StickEffectHandler {
 					continue;
 				}
 
+				markInfectedBlock(world, next);
+
 				if (currentState.getBlock() != sourceBlock) {
 					world.setBlockState(next, sourceState, Block.NOTIFY_ALL);
 				}
@@ -444,10 +546,10 @@ public final class StickEffectHandler {
 			INFECTION_VICTIMS.compute(mob.getUuid(), (uuid, existing) -> {
 				if (existing == null) {
 					return new InfectionVictimState(world.getRegistryKey(), mob.isAiDisabled(), mob.getCustomName(),
-							mob.isCustomNameVisible(), worldTime + 25L);
+							mob.isCustomNameVisible(), worldTime + INFECTION_VICTIM_DURATION_TICKS);
 				}
 
-				existing.expireAt = worldTime + 25L;
+				existing.expireAt = worldTime + INFECTION_VICTIM_DURATION_TICKS;
 				return existing;
 			});
 
@@ -510,6 +612,10 @@ public final class StickEffectHandler {
 
 			iterator.remove();
 		}
+
+		BOUNCE_CHAIN.entrySet()
+				.removeIf(entry -> worldTime - BOUNCE_LAST_TICK.getOrDefault(entry.getKey(), -100L) > 20L);
+		BOUNCE_LAST_TICK.entrySet().removeIf(entry -> worldTime - entry.getValue() > 20L);
 	}
 
 	private static void applySpeed(ServerWorld world, Set<BlockPos> speedPositions) {
@@ -555,8 +661,179 @@ public final class StickEffectHandler {
 		player.giveItemStack(InfinityItemSupport.createInfiniteBlockStack(block));
 	}
 
-	private static void damageEntity(ServerWorld world, LivingEntity entity, float amount) {
-		entity.damage(world.getDamageSources().magic(), amount);
+	private static void grantInfectedBlock(PlayerEntity player, Block block) {
+		if (block.asItem() == Items.AIR) {
+			return;
+		}
+
+		ItemStack infectedStack = new ItemStack(block.asItem());
+		infectedStack.set(DataComponentTypes.CUSTOM_NAME, Text.literal("§r受到感染的方塊"));
+
+		NbtCompound infectedData = new NbtCompound();
+		infectedData.putBoolean(INFECTED_BLOCK_DATA_KEY, true);
+		infectedData.putString(INFECTED_SOURCE_BLOCK_KEY, Registries.BLOCK.getId(block).toString());
+		infectedStack.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.of(infectedData));
+
+		player.giveItemStack(infectedStack);
+	}
+
+	private static boolean isInfectedBlockItem(ItemStack stack) {
+		NbtComponent customData = stack.get(DataComponentTypes.CUSTOM_DATA);
+		if (customData == null) {
+			return false;
+		}
+
+		NbtCompound data = customData.copyNbt();
+		return data.getBoolean(INFECTED_BLOCK_DATA_KEY);
+	}
+
+	private static Block readInfectedSourceBlock(ItemStack stack) {
+		NbtComponent customData = stack.get(DataComponentTypes.CUSTOM_DATA);
+		if (customData == null) {
+			return Blocks.AIR;
+		}
+
+		NbtCompound data = customData.copyNbt();
+		if (!data.contains(INFECTED_SOURCE_BLOCK_KEY, NbtElement.STRING_TYPE)) {
+			return Blocks.AIR;
+		}
+
+		Identifier id = Identifier.tryParse(data.getString(INFECTED_SOURCE_BLOCK_KEY));
+		if (id == null || !Registries.BLOCK.containsId(id)) {
+			return Blocks.AIR;
+		}
+
+		return Registries.BLOCK.get(id);
+	}
+
+	private static void markInfectedBlock(ServerWorld world, BlockPos pos) {
+		INFECTED_BLOCKS.computeIfAbsent(world.getRegistryKey(), unused -> new HashSet<>()).add(pos.asLong());
+	}
+
+	private static boolean consumeInfectedBlockMark(ServerWorld world, BlockPos pos) {
+		Set<Long> marked = INFECTED_BLOCKS.get(world.getRegistryKey());
+		if (marked == null) {
+			return false;
+		}
+
+		boolean consumed = marked.remove(pos.asLong());
+		if (marked.isEmpty()) {
+			INFECTED_BLOCKS.remove(world.getRegistryKey());
+		}
+
+		return consumed;
+	}
+
+	private static void createInfectionMarker(ServerWorld world, BlockPos pos, Block sourceBlock) {
+		DisplayEntity.ItemDisplayEntity marker = findMarker(world, pos);
+		if (marker == null) {
+			marker = createMarker(world, pos);
+			if (marker == null) {
+				return;
+			}
+		}
+
+		MarkerState markerState = readMarkerState(marker);
+		markerState.effects.add(StickEffect.INFECTION);
+		markerState.sourceBlock = sourceBlock;
+		markerState.heavyStarted = false;
+		resetExplosionState(markerState);
+		markerState.expiresAt = world.getTime() + StickEffect.INFECTION.durationTicks();
+		writeMarkerState(marker, markerState);
+	}
+
+	private static boolean handleExpiredExplosion(ServerWorld world, DisplayEntity.ItemDisplayEntity marker,
+			MarkerState markerState, BlockPos pos, long worldTime) {
+		if (hasBlackHoleExplosionCombo(markerState)) {
+			return false;
+		}
+
+		if (world.getRegistryKey() != World.END) {
+			triggerExplosion(world, pos);
+			return false;
+		}
+
+		if (markerState.explosionBurstsRemaining <= 0) {
+			markerState.explosionBurstsRemaining = END_EXPLOSION_BURST_COUNT;
+			markerState.nextExplosionTick = worldTime;
+		}
+
+		if (worldTime < markerState.nextExplosionTick) {
+			writeMarkerState(marker, markerState);
+			return true;
+		}
+
+		triggerExplosion(world, pos);
+		markerState.explosionBurstsRemaining--;
+
+		if (markerState.explosionBurstsRemaining > 0) {
+			markerState.nextExplosionTick = worldTime + END_EXPLOSION_INTERVAL_TICKS;
+			writeMarkerState(marker, markerState);
+			return true;
+		}
+
+		return false;
+	}
+
+	private static void triggerExplosion(ServerWorld world, BlockPos pos) {
+		world.createExplosion(null, pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D,
+				EXPLOSION_POWER,
+				World.ExplosionSourceType.BLOCK);
+		applyDragonExplosionDamage(world, pos);
+	}
+
+	private static boolean shouldTriggerBlackHoleExplosionCombo(MarkerState markerState, long worldTime) {
+		return hasBlackHoleExplosionCombo(markerState)
+				&& markerState.nextExplosionTick >= 0L
+				&& worldTime >= markerState.nextExplosionTick;
+	}
+
+	private static boolean hasBlackHoleExplosionCombo(MarkerState markerState) {
+		return markerState.effects.contains(StickEffect.BLACK_HOLE)
+				&& markerState.effects.contains(StickEffect.EXPLOSION);
+	}
+
+	private static void applyDragonExplosionDamage(ServerWorld world, BlockPos pos) {
+		Vec3d center = pos.toCenterPos();
+		// 龍非常大，將搜尋方框設為 20x20x20
+		Box searchBox = new Box(pos).expand(10.0);
+
+		// 使用 getOtherEntities(null, ...) 抓取範圍內「任何」實體
+		List<Entity> allEntities = world.getOtherEntities(null, searchBox);
+
+		Set<EnderDragonEntity> damagedDragons = new HashSet<>();
+
+		for (Entity entity : allEntities) {
+			EnderDragonEntity dragon = null;
+
+			// 核心邏輯：判斷它是龍的主體還是部位
+			if (entity instanceof EnderDragonEntity d) {
+				dragon = d;
+			} else if (entity instanceof EnderDragonPart part) {
+				dragon = part.owner;
+			}
+
+			if (dragon != null && dragon.isAlive() && !damagedDragons.contains(dragon)) {
+				// 計算這個實體（部位或主體）與中心的距離
+				double distSq = entity.squaredDistanceTo(center);
+
+				// 距離檢查（32 的平方是 1024）
+				if (distSq <= 1024) {
+					// 強制執行傷害邏輯
+					damageEntity(world, dragon, 1000.0F);
+
+					// 標記已受傷
+					damagedDragons.add(dragon);
+
+					// 100% 會在控制台顯示的訊息
+					System.out.println(">>> [DEBUG] damage success: " + entity.getType().getName().getString());
+
+					// 視覺回饋：在命中的位置生成巨大爆炸粒子
+					world.spawnParticles(ParticleTypes.EXPLOSION_EMITTER,
+							entity.getX(), entity.getY(), entity.getZ(), 1, 0, 0, 0, 0);
+				}
+			}
+		}
 	}
 
 	private static void repairItem(ItemStack stack, int amount) {
@@ -730,7 +1007,8 @@ public final class StickEffectHandler {
 				// 冷卻檢查 (20L = 1秒一次傷害)
 				if (worldTime - lastHit >= 20L) {
 					// 執行傷害
-					entity.damage(world.getDamageSources().magic(), THORNS_DAMAGE);
+					float thornsDamage = entity instanceof EnderDragonEntity ? DRAGON_THORNS_DAMAGE : THORNS_DAMAGE;
+					damageEntity(world, entity, thornsDamage);
 
 					// 播放刺痛音效或粒子
 					world.playSound(null, pos, SoundEvents.ENCHANT_THORNS_HIT, SoundCategory.BLOCKS, 0.5f, 1.0f);
@@ -745,14 +1023,51 @@ public final class StickEffectHandler {
 		}
 	}
 
+	private static void damageEntity(ServerWorld world, LivingEntity entity, float amount) {
+		if (entity instanceof EnderDragonEntity dragon) {
+			// 直接先嘗試對主體造成傷害 (部分模組或修改過的實體可能接受)
+			DamageSources sources = world.getDamageSources();
+
+// 1. 魔法傷害 (最接近你原本想寫的 MAGIC)
+
+			boolean hit = dragon.damage(sources.explosion(null, null), 30.0f);
+			
+			// 如果主體免疫，嘗試暴力遍歷所有 子部件 (EnderDragonPart)
+			// 注意：原版龍的 damage() 對主體通常無效，必須打部件
+			// 這裡我們不使用複雜的 Accessor 或 Reflection，直接嘗試尋找部件實體
+			if (!hit) {
+				List<EnderDragonPart> parts = world.getEntitiesByClass(
+						EnderDragonPart.class,
+						dragon.getBoundingBox().expand(5.0),
+						p -> p.owner == dragon);
+
+				for (EnderDragonPart part : parts) {
+					if (part.damage(sources.explosion(null, null), 30.0f)) {
+						hit = true;
+						// 只要有一個部件受傷就算成功，不需要每個都打
+						break;
+					}
+				}
+			}
+		} else {
+			entity.damage(world.getDamageSources().magic(), amount);
+		}
+	}
 	private static void clearMarkerEffects(DisplayEntity.ItemDisplayEntity marker, MarkerState markerState) {
 		markerState.effects.clear();
 		markerState.expiresAt = -1L;
 		markerState.heavyStarted = false;
+		resetExplosionState(markerState);
 		markerState.explosionPrimed = true;
 		writeMarkerState(marker, markerState);
 		resetMarkerVisual(marker);
 		marker.setInvisible(false);
+	}
+
+	private static void resetExplosionState(MarkerState markerState) {
+		markerState.explosionPrimed = false;
+		markerState.explosionBurstsRemaining = 0;
+		markerState.nextExplosionTick = -1L;
 	}
 
 	private static MarkerState readMarkerState(DisplayEntity.ItemDisplayEntity marker) {
@@ -799,6 +1114,12 @@ public final class StickEffectHandler {
 			state.heavyY = markerData.getDouble(HEAVY_Y_KEY);
 		}
 		state.explosionPrimed = markerData.getBoolean(EXPLOSION_PRIMED_KEY);
+		if (markerData.contains(EXPLOSION_BURSTS_REMAINING_KEY, NbtElement.INT_TYPE)) {
+			state.explosionBurstsRemaining = markerData.getInt(EXPLOSION_BURSTS_REMAINING_KEY);
+		}
+		if (markerData.contains(NEXT_EXPLOSION_TICK_KEY, NbtElement.LONG_TYPE)) {
+			state.nextExplosionTick = markerData.getLong(NEXT_EXPLOSION_TICK_KEY);
+		}
 		return state;
 	}
 
@@ -825,6 +1146,12 @@ public final class StickEffectHandler {
 			markerData.putDouble(HEAVY_Y_KEY, markerState.heavyY);
 		}
 		markerData.putBoolean(EXPLOSION_PRIMED_KEY, markerState.explosionPrimed);
+		if (markerState.explosionBurstsRemaining > 0) {
+			markerData.putInt(EXPLOSION_BURSTS_REMAINING_KEY, markerState.explosionBurstsRemaining);
+		}
+		if (markerState.nextExplosionTick >= 0L) {
+			markerData.putLong(NEXT_EXPLOSION_TICK_KEY, markerState.nextExplosionTick);
+		}
 		data.put(MARKER_DATA_KEY, markerData);
 		displayStack.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.of(data));
 		marker.getStackReference(0).set(displayStack);
@@ -863,6 +1190,8 @@ public final class StickEffectHandler {
 		private boolean heavyStarted;
 		private double heavyY = Double.NaN;
 		private boolean explosionPrimed;
+		private int explosionBurstsRemaining;
+		private long nextExplosionTick = -1L;
 
 		private static MarkerState empty() {
 			return new MarkerState();

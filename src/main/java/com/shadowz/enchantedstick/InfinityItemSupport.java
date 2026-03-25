@@ -22,7 +22,7 @@ public final class InfinityItemSupport {
 		data.putString(BLOCK_ID_KEY, Registries.BLOCK.getId(block).toString());
 		setCustomData(stack, data);
 		stack.set(DataComponentTypes.ENCHANTMENT_GLINT_OVERRIDE, true);
-		stack.set(DataComponentTypes.CUSTOM_NAME, Text.literal(stack.getName().getString() + " [Infinity]"));
+		stack.set(DataComponentTypes.CUSTOM_NAME, Text.literal("§r§f" + stack.getName().getString()));
 		return stack;
 	}
 

@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.Locale;
 
 public enum StickEffect {
-	BLACK_HOLE("black_hole", StickEnchantments.BLACK_HOLE, 100),
+	BLACK_HOLE("black_hole", StickEnchantments.BLACK_HOLE, 400),
 	THORNS("thorns", StickEnchantments.THORNS, 0),
 	EXPLOSION("explosion", StickEnchantments.EXPLOSION, 60),
 	HEAVY("heavy", StickEnchantments.HEAVY, 100),
