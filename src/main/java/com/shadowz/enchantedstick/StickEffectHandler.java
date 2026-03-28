@@ -76,14 +76,13 @@ public final class StickEffectHandler {
 	private static final String EXPLOSION_PRIMED_KEY = "explosion_primed";
 	private static final String EXPLOSION_BURSTS_REMAINING_KEY = "explosion_bursts_remaining";
 	private static final String NEXT_EXPLOSION_TICK_KEY = "next_explosion_tick";
+	private static final String CASTER_UUID_KEY = "caster_uuid";
 	private static final float THORNS_DAMAGE = 3.0F;
 	private static final float DRAGON_THORNS_DAMAGE = 8.0F;
 	private static final float EXPLOSION_POWER = 6.0F;
 	private static final long BLACK_HOLE_EXPLOSION_INTERVAL_TICKS = 5L;
 	private static final int END_EXPLOSION_BURST_COUNT = 10;
 	private static final long END_EXPLOSION_INTERVAL_TICKS = 5L;
-	private static final double DRAGON_EXPLOSION_RANGE = 12.0D;
-	private static final float DRAGON_EXPLOSION_DAMAGE = 24.0F;
 	private static final double BLACK_HOLE_RANGE = 100.0D;
 	private static final double INFECTION_MOB_RANGE = 50.0D;
 	private static final int INFECTION_LIMIT = 100;
@@ -100,6 +99,13 @@ public final class StickEffectHandler {
 	private static final Map<String, Long> THORNS_COOLDOWNS = new HashMap<>();
 	private static final Map<UUID, Integer> SPEED_PROGRESS = new HashMap<>();
 	private static final Set<UUID> SPEED_ACTIVE = new HashSet<>();
+	private static final Map<UUID, Long> SPEED_LEFT_TICK = new HashMap<>();
+	private static final Map<UUID, Integer> CHARGE_STRENGTH_LEVEL = new HashMap<>();
+	private static final Map<UUID, Long> CHARGE_STRENGTH_TICK = new HashMap<>();
+	private static final Map<UUID, Integer> CHARGE_ABSORPTION_LEVEL = new HashMap<>();
+	private static final Map<UUID, Long> CHARGE_ABSORPTION_TICK = new HashMap<>();
+	private static final Set<UUID> CHARGE_ACTIVE = new HashSet<>();
+	private static final Map<UUID, Long> CHARGE_LEFT_TICK = new HashMap<>();
 	private static final Map<UUID, InfectionSpread> ACTIVE_INFECTIONS = new HashMap<>();
 	private static final Map<UUID, InfectionVictimState> INFECTION_VICTIMS = new HashMap<>();
 	private static final Map<net.minecraft.registry.RegistryKey<World>, Set<Long>> INFECTED_BLOCKS = new HashMap<>();
@@ -125,7 +131,7 @@ public final class StickEffectHandler {
 		ItemStack stack = player.getStackInHand(hand);
 
 		if (isCustomEnchantedStick(stack, serverWorld)) {
-			markBlock(serverWorld, pos, stack);
+			markBlock(serverWorld, pos, stack, player);
 			return ActionResult.PASS;
 		}
 
@@ -263,7 +269,7 @@ public final class StickEffectHandler {
 			}
 
 			if (markerState.effects.contains(StickEffect.BLACK_HOLE)) {
-				applyBlackHole(world, pos);
+				applyBlackHole(world, pos, markerState.casterUuid);
 			}
 
 			if (markerState.effects.contains(StickEffect.BOUNCE)) {
@@ -299,7 +305,7 @@ public final class StickEffectHandler {
 		applySpeed(world, speedPositions);
 	}
 
-	private static void markBlock(ServerWorld world, BlockPos pos, ItemStack stack) {
+	private static void markBlock(ServerWorld world, BlockPos pos, ItemStack stack, PlayerEntity player) {
 		BlockState blockState = world.getBlockState(pos);
 
 		if (blockState.isAir()) {
@@ -325,6 +331,7 @@ public final class StickEffectHandler {
 		markerState.effects.addAll(newEffects);
 		markerState.sourceBlock = blockState.getBlock();
 		markerState.heavyStarted = false;
+		markerState.casterUuid = player.getUuid();
 		resetExplosionState(markerState);
 		configureMarkerDurations(markerState, world.getTime());
 		writeMarkerState(marker, markerState);
@@ -426,12 +433,15 @@ public final class StickEffectHandler {
 		return effects;
 	}
 
-	private static void applyBlackHole(ServerWorld world, BlockPos pos) {
+	private static void applyBlackHole(ServerWorld world, BlockPos pos, UUID casterUuid) {
 		Vec3d center = pos.toCenterPos();
 		Box box = new Box(pos).expand(BLACK_HOLE_RANGE);
 
-		for (LivingEntity entity : world.getEntitiesByClass(LivingEntity.class, box,
-				living -> !(living instanceof PlayerEntity))) {
+		for (LivingEntity entity : world.getEntitiesByClass(LivingEntity.class, box, e -> true)) {
+			// 排除施放者
+			if (entity instanceof PlayerEntity && casterUuid != null && entity.getUuid().equals(casterUuid)) {
+				continue;
+			}
 			Vec3d direction = center.subtract(entity.getPos());
 			double distance = Math.max(direction.length(), 0.001D);
 			Vec3d velocity = direction.normalize()
@@ -469,33 +479,113 @@ public final class StickEffectHandler {
 
 		for (LivingEntity entity : world.getEntitiesByClass(LivingEntity.class, box,
 				living -> living.isOnGround() && living.getY() >= pos.getY() + 0.9D)) {
-			breakMarkedBlock(world, pos, null, false);
+			breakMarkedBlock(world, pos, null, true);
 			return;
 		}
 	}
 
 	private static void applyCharge(ServerWorld world, Set<BlockPos> chargePositions, long worldTime) {
-		if (worldTime % 20L != 0L) {
-			return;
-		}
+		final long CHARGE_EFFECT_DURATION = 200L; // 10秒 = 200 ticks
+		final long STRENGTH_INTERVAL = 100L; // 5秒 = 100 ticks
+		final long ABSORPTION_INTERVAL = 60L; // 3秒 = 60 ticks
 
-		if (chargePositions.isEmpty()) {
-			return;
-		}
+		for (PlayerEntity player : world.getPlayers()) {
+			UUID playerUuid = player.getUuid();
+			BlockPos trackedBlock = findTrackedFootBlock(player, chargePositions);
 
-		for (PlayerEntity player : world.getPlayers(player -> findTrackedFootBlock(player, chargePositions) != null)) {
-			player.heal(CHARGE_HEAL_PER_SECOND);
-			player.addExperience(CHARGE_LEVEL_PER_SECOND);
+			if (trackedBlock != null) {
+				// 玩家在方塊上，應用所有效果
+				CHARGE_ACTIVE.add(playerUuid);
+				CHARGE_LEFT_TICK.remove(playerUuid);
 
-			HungerManager hungerManager = player.getHungerManager();
-			hungerManager.add(CHARGE_FOOD_PER_SECOND, CHARGE_SATURATION_PER_SECOND);
+				// 初始化力量計時器（第一次進入時）
+				if (!CHARGE_STRENGTH_TICK.containsKey(playerUuid)) {
+					CHARGE_STRENGTH_TICK.put(playerUuid, worldTime - STRENGTH_INTERVAL);
+				}
 
-			for (ItemStack armorStack : player.getArmorItems()) {
-				repairItem(armorStack, CHARGE_REPAIR_PER_SECOND);
+				// 初始化吸收計時器（第一次進入時）
+				if (!CHARGE_ABSORPTION_TICK.containsKey(playerUuid)) {
+					CHARGE_ABSORPTION_TICK.put(playerUuid, worldTime - ABSORPTION_INTERVAL);
+				}
+
+				// 每20 ticks (1秒) 執行一次基礎效果
+				if (worldTime % 20L == 0L) {
+					player.heal(CHARGE_HEAL_PER_SECOND);
+					player.addExperience(CHARGE_LEVEL_PER_SECOND);
+
+					HungerManager hungerManager = player.getHungerManager();
+					hungerManager.add(CHARGE_FOOD_PER_SECOND, CHARGE_SATURATION_PER_SECOND);
+
+					for (ItemStack armorStack : player.getArmorItems()) {
+						repairItem(armorStack, CHARGE_REPAIR_PER_SECOND);
+					}
+
+					repairItem(player.getMainHandStack(), CHARGE_REPAIR_PER_SECOND);
+					repairItem(player.getOffHandStack(), CHARGE_REPAIR_PER_SECOND);
+				}
+
+				// 力量等級計算 (每5秒增加一級, 最多5級)
+				long strengthTick = CHARGE_STRENGTH_TICK.get(playerUuid);
+				if (worldTime - strengthTick >= STRENGTH_INTERVAL) {
+					int strengthLevel = CHARGE_STRENGTH_LEVEL.getOrDefault(playerUuid, 0);
+					if (strengthLevel < 5) {
+						strengthLevel++;
+						CHARGE_STRENGTH_LEVEL.put(playerUuid, strengthLevel);
+					}
+					CHARGE_STRENGTH_TICK.put(playerUuid, worldTime);
+				}
+
+				// 吸收等級計算 (每3秒增加一級, 最多5級)
+				long absorptionTick = CHARGE_ABSORPTION_TICK.get(playerUuid);
+				if (worldTime - absorptionTick >= ABSORPTION_INTERVAL) {
+					int absorptionLevel = CHARGE_ABSORPTION_LEVEL.getOrDefault(playerUuid, 0);
+					if (absorptionLevel < 5) {
+						absorptionLevel++;
+						CHARGE_ABSORPTION_LEVEL.put(playerUuid, absorptionLevel);
+					}
+					CHARGE_ABSORPTION_TICK.put(playerUuid, worldTime);
+				}
+
+				// 應用力量和吸收效果
+				int strengthLevel = CHARGE_STRENGTH_LEVEL.getOrDefault(playerUuid, 0);
+				int absorptionLevel = CHARGE_ABSORPTION_LEVEL.getOrDefault(playerUuid, 0);
+
+				if (strengthLevel > 0) {
+					player.addStatusEffect(new StatusEffectInstance(StatusEffects.STRENGTH, 10, strengthLevel - 1, true, false, true));
+				}
+				if (absorptionLevel > 0) {
+					player.addStatusEffect(new StatusEffectInstance(StatusEffects.ABSORPTION, 10, absorptionLevel - 1, true, false, true));
+				}
+
+			} else if (CHARGE_ACTIVE.contains(playerUuid)) {
+				// 玩家已離開方塊，紀錄離開的時間
+				if (!CHARGE_LEFT_TICK.containsKey(playerUuid)) {
+					CHARGE_LEFT_TICK.put(playerUuid, worldTime);
+				}
+
+				// 檢查是否還在10秒效果時間內
+				long leftTime = CHARGE_LEFT_TICK.get(playerUuid);
+				if (worldTime - leftTime < CHARGE_EFFECT_DURATION) {
+					// 保留效果，但不增加進度
+					int strengthLevel = CHARGE_STRENGTH_LEVEL.getOrDefault(playerUuid, 0);
+					int absorptionLevel = CHARGE_ABSORPTION_LEVEL.getOrDefault(playerUuid, 0);
+
+					if (strengthLevel > 0) {
+						player.addStatusEffect(new StatusEffectInstance(StatusEffects.STRENGTH, 10, strengthLevel - 1, true, false, true));
+					}
+					if (absorptionLevel > 0) {
+						player.addStatusEffect(new StatusEffectInstance(StatusEffects.ABSORPTION, 10, absorptionLevel - 1, true, false, true));
+					}
+				} else {
+					// 10秒已過，移除效果
+					CHARGE_STRENGTH_LEVEL.remove(playerUuid);
+					CHARGE_STRENGTH_TICK.remove(playerUuid);
+					CHARGE_ABSORPTION_LEVEL.remove(playerUuid);
+					CHARGE_ABSORPTION_TICK.remove(playerUuid);
+					CHARGE_ACTIVE.remove(playerUuid);
+					CHARGE_LEFT_TICK.remove(playerUuid);
+				}
 			}
-
-			repairItem(player.getMainHandStack(), CHARGE_REPAIR_PER_SECOND);
-			repairItem(player.getOffHandStack(), CHARGE_REPAIR_PER_SECOND);
 		}
 	}
 
@@ -619,18 +709,41 @@ public final class StickEffectHandler {
 	}
 
 	private static void applySpeed(ServerWorld world, Set<BlockPos> speedPositions) {
-		for (PlayerEntity player : world.getPlayers()) {
-			if (findTrackedFootBlock(player, speedPositions) == null) {
-				SPEED_PROGRESS.remove(player.getUuid());
-				SPEED_ACTIVE.remove(player.getUuid());
-				continue;
-			}
+		long worldTime = world.getTime();
+		final long SPEED_EFFECT_DURATION = 200L; // 10秒 = 200 ticks
 
-			int progress = SPEED_PROGRESS.getOrDefault(player.getUuid(), 0) + 1;
-			SPEED_PROGRESS.put(player.getUuid(), progress);
-			SPEED_ACTIVE.add(player.getUuid());
-			player.addStatusEffect(
-					new StatusEffectInstance(StatusEffects.SPEED, 5, Math.min(progress / 20, 4), true, false, true));
+		for (PlayerEntity player : world.getPlayers()) {
+			UUID playerUuid = player.getUuid();
+			BlockPos trackedBlock = findTrackedFootBlock(player, speedPositions);
+
+			if (trackedBlock != null) {
+				// 玩家在方塊上，持續增加進度
+				int progress = SPEED_PROGRESS.getOrDefault(playerUuid, 0) + 1;
+				SPEED_PROGRESS.put(playerUuid, progress);
+				SPEED_ACTIVE.add(playerUuid);
+				SPEED_LEFT_TICK.remove(playerUuid); // 清除離開時間記錄
+				player.addStatusEffect(
+						new StatusEffectInstance(StatusEffects.SPEED, 10, Math.min(progress / 20, 4), true, false, true));
+			} else if (SPEED_ACTIVE.contains(playerUuid)) {
+				// 玩家已離開方塊，紀錄離開的時間
+				if (!SPEED_LEFT_TICK.containsKey(playerUuid)) {
+					SPEED_LEFT_TICK.put(playerUuid, worldTime);
+				}
+
+				// 檢查是否還在10秒效果時間內
+				long leftTime = SPEED_LEFT_TICK.get(playerUuid);
+				if (worldTime - leftTime < SPEED_EFFECT_DURATION) {
+					// 保留效果，但不增加進度
+					int progress = SPEED_PROGRESS.getOrDefault(playerUuid, 0);
+					player.addStatusEffect(
+							new StatusEffectInstance(StatusEffects.SPEED, 10, Math.min(progress / 20, 4), true, false, true));
+				} else {
+					// 10秒已過，移除效果
+					SPEED_PROGRESS.remove(playerUuid);
+					SPEED_ACTIVE.remove(playerUuid);
+					SPEED_LEFT_TICK.remove(playerUuid);
+				}
+			}
 		}
 	}
 
@@ -1120,6 +1233,13 @@ public final class StickEffectHandler {
 		if (markerData.contains(NEXT_EXPLOSION_TICK_KEY, NbtElement.LONG_TYPE)) {
 			state.nextExplosionTick = markerData.getLong(NEXT_EXPLOSION_TICK_KEY);
 		}
+		if (markerData.contains(CASTER_UUID_KEY, NbtElement.STRING_TYPE)) {
+			try {
+				state.casterUuid = UUID.fromString(markerData.getString(CASTER_UUID_KEY));
+			} catch (IllegalArgumentException e) {
+				state.casterUuid = null;
+			}
+		}
 		return state;
 	}
 
@@ -1151,6 +1271,9 @@ public final class StickEffectHandler {
 		}
 		if (markerState.nextExplosionTick >= 0L) {
 			markerData.putLong(NEXT_EXPLOSION_TICK_KEY, markerState.nextExplosionTick);
+		}
+		if (markerState.casterUuid != null) {
+			markerData.putString(CASTER_UUID_KEY, markerState.casterUuid.toString());
 		}
 		data.put(MARKER_DATA_KEY, markerData);
 		displayStack.set(DataComponentTypes.CUSTOM_DATA, NbtComponent.of(data));
@@ -1192,6 +1315,7 @@ public final class StickEffectHandler {
 		private boolean explosionPrimed;
 		private int explosionBurstsRemaining;
 		private long nextExplosionTick = -1L;
+		private UUID casterUuid = null;
 
 		private static MarkerState empty() {
 			return new MarkerState();
